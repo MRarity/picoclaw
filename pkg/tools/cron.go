@@ -272,6 +272,12 @@ func (t *CronTool) ExecuteJob(ctx context.Context, job *cron.CronJob) string {
 		chatID = "direct"
 	}
 
+	// If the original channel is wecom_aibot, switch to wecom_app for scheduled delivery
+	// because wecom_aibot requires an active stream context which doesn't exist for cron jobs
+	if channel == "wecom_aibot" {
+		channel = "wecom_app"
+	}
+
 	// Execute command if present
 	if job.Payload.Command != "" {
 		args := map[string]any{

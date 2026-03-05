@@ -561,6 +561,11 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			"matched_by":  route.MatchedBy,
 		})
 
+	// 注入渠道信息到 context，用于对话记录
+	ctx = context.WithValue(ctx, "picoclaw_channel", msg.Channel)
+	ctx = context.WithValue(ctx, "picoclaw_session_id", sessionKey)
+	ctx = context.WithValue(ctx, "picoclaw_user_id", msg.SenderID)
+
 	return al.runAgentLoop(ctx, agent, processOptions{
 		SessionKey:      sessionKey,
 		Channel:         msg.Channel,
@@ -626,6 +631,11 @@ func (al *AgentLoop) processSystemMessage(
 
 	// Use the origin session for context
 	sessionKey := routing.BuildAgentMainSessionKey(agent.ID)
+
+	// 注入渠道信息到 context，用于对话记录
+	ctx = context.WithValue(ctx, "picoclaw_channel", originChannel)
+	ctx = context.WithValue(ctx, "picoclaw_session_id", sessionKey)
+	ctx = context.WithValue(ctx, "picoclaw_user_id", msg.SenderID)
 
 	return al.runAgentLoop(ctx, agent, processOptions{
 		SessionKey:      sessionKey,

@@ -177,6 +177,17 @@ func (p *Provider) Chat(
 		req.Header.Set("Authorization", "Bearer "+p.apiKey)
 	}
 
+	// 添加渠道信息用于对话记录
+	if channel, ok := ctx.Value("picoclaw_channel").(string); ok && channel != "" {
+		req.Header.Set("X-Picoclaw-Channel", channel)
+	}
+	if sessionID, ok := ctx.Value("picoclaw_session_id").(string); ok && sessionID != "" {
+		req.Header.Set("X-Session-Id", sessionID)
+	}
+	if userID, ok := ctx.Value("picoclaw_user_id").(string); ok && userID != "" {
+		req.Header.Set("X-User-Id", userID)
+	}
+
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
