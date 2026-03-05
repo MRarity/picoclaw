@@ -7,6 +7,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -21,6 +22,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/identity"
 	"github.com/sipeed/picoclaw/pkg/logger"
+	"github.com/sipeed/picoclaw/pkg/media"
 	"github.com/sipeed/picoclaw/pkg/utils"
 )
 
@@ -55,6 +57,8 @@ type WeComXMLMessage struct {
 	MediaId      string   `xml:"MediaId"`
 	Format       string   `xml:"Format"`
 	ThumbMediaId string   `xml:"ThumbMediaId"`
+	FileName     string   `xml:"FileName"`     // For file messages
+	FileSize     int64    `xml:"FileSize"`     // For file messages (optional)
 	LocationX    float64  `xml:"Location_X"`
 	LocationY    float64  `xml:"Location_Y"`
 	Scale        int      `xml:"Scale"`
@@ -95,6 +99,38 @@ type WeComImageMessage struct {
 	Image   struct {
 		MediaID string `json:"media_id"`
 	} `json:"image"`
+}
+
+// WeComVoiceMessage represents voice message for sending
+type WeComVoiceMessage struct {
+	ToUser  string `json:"touser"`
+	MsgType string `json:"msgtype"`
+	AgentID int64  `json:"agentid"`
+	Voice   struct {
+		MediaID string `json:"media_id"`
+	} `json:"voice"`
+}
+
+// WeComVideoMessage represents video message for sending
+type WeComVideoMessage struct {
+	ToUser  string `json:"touser"`
+	MsgType string `json:"msgtype"`
+	AgentID int64  `json:"agentid"`
+	Video   struct {
+		MediaID     string `json:"media_id"`
+		Title       string `json:"title,omitempty"`
+		Description string `json:"description,omitempty"`
+	} `json:"video"`
+}
+
+// WeComFileMessage represents file message for sending
+type WeComFileMessage struct {
+	ToUser  string `json:"touser"`
+	MsgType string `json:"msgtype"`
+	AgentID int64  `json:"agentid"`
+	File    struct {
+		MediaID string `json:"media_id"`
+	} `json:"file"`
 }
 
 // WeComAccessTokenResponse represents the access token API response
@@ -264,19 +300,27 @@ func (c *WeComAppChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMe
 		}
 
 		// Send media message using the media_id
-		if mediaType == "image" {
-			err = c.sendImageMessage(ctx, accessToken, msg.ChatID, mediaID)
-		} else {
-			// For non-image types, send as text fallback with caption
+		var sendErr error
+		switch mediaType {
+		case "image":
+			sendErr = c.sendImageMessage(ctx, accessToken, msg.ChatID, mediaID)
+		case "voice":
+			sendErr = c.sendVoiceMessage(ctx, accessToken, msg.ChatID, mediaID)
+		case "video":
+			sendErr = c.sendVideoMessage(ctx, accessToken, msg.ChatID, mediaID, part.Caption, "")
+		case "file":
+			sendErr = c.sendFileMessage(ctx, accessToken, msg.ChatID, mediaID)
+		default:
+			// For unknown types, send as text fallback with caption
 			caption := part.Caption
 			if caption == "" {
 				caption = fmt.Sprintf("[%s: %s]", part.Type, part.Filename)
 			}
-			err = c.sendTextMessage(ctx, accessToken, msg.ChatID, caption)
+			sendErr = c.sendTextMessage(ctx, accessToken, msg.ChatID, caption)
 		}
 
-		if err != nil {
-			return err
+		if sendErr != nil {
+			return sendErr
 		}
 	}
 
@@ -401,6 +445,251 @@ func (c *WeComAppChannel) sendImageMessage(ctx context.Context, accessToken, use
 	}
 	msg.Image.MediaID = mediaID
 	return c.sendWeComMessage(ctx, accessToken, msg)
+}
+
+// sendVoiceMessage sends a voice message using a media_id.
+func (c *WeComAppChannel) sendVoiceMessage(ctx context.Context, accessToken, userID, mediaID string) error {
+	msg := WeComVoiceMessage{
+		ToUser:  userID,
+		MsgType: "voice",
+		AgentID: c.config.AgentID,
+	}
+	msg.Voice.MediaID = mediaID
+	return c.sendWeComMessage(ctx, accessToken, msg)
+}
+
+// sendVideoMessage sends a video message using a media_id.
+func (c *WeComAppChannel) sendVideoMessage(ctx context.Context, accessToken, userID, mediaID, title, description string) error {
+	msg := WeComVideoMessage{
+		ToUser:  userID,
+		MsgType: "video",
+		AgentID: c.config.AgentID,
+	}
+	msg.Video.MediaID = mediaID
+	if title != "" {
+		msg.Video.Title = title
+	}
+	if description != "" {
+		msg.Video.Description = description
+	}
+	return c.sendWeComMessage(ctx, accessToken, msg)
+}
+
+// sendFileMessage sends a file message using a media_id.
+func (c *WeComAppChannel) sendFileMessage(ctx context.Context, accessToken, userID, mediaID string) error {
+	msg := WeComFileMessage{
+		ToUser:  userID,
+		MsgType: "file",
+		AgentID: c.config.AgentID,
+	}
+	msg.File.MediaID = mediaID
+	return c.sendWeComMessage(ctx, accessToken, msg)
+}
+
+// downloadAndStoreMedia downloads media from WeCom and stores it in the media store.
+// Returns the media store reference (ref) or empty string on error.
+// filename is optional - if provided, it will be used as the stored filename.
+func (c *WeComAppChannel) downloadAndStoreMedia(ctx context.Context, mediaID, mediaType, senderID, msgID string, filenameHint ...string) string {
+	accessToken := c.getAccessToken()
+	if accessToken == "" {
+		logger.WarnCF("wecom_app", "No access token available for media download", map[string]any{
+			"media_id": mediaID,
+		})
+		return ""
+	}
+
+	store := c.GetMediaStore()
+	if store == nil {
+		logger.WarnC("wecom_app", "No media store available")
+		return ""
+	}
+
+	// Download media from WeCom API
+	apiURL := fmt.Sprintf("%s/cgi-bin/media/get?access_token=%s&media_id=%s",
+		wecomAPIBase, url.QueryEscape(accessToken), url.QueryEscape(mediaID))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		logger.ErrorCF("wecom_app", "Failed to create download request", map[string]any{
+			"error":    err.Error(),
+			"media_id": mediaID,
+		})
+		return ""
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		logger.ErrorCF("wecom_app", "Failed to download media", map[string]any{
+			"error":    err.Error(),
+			"media_id": mediaID,
+		})
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		logger.ErrorCF("wecom_app", "Media download failed", map[string]any{
+			"status":   resp.StatusCode,
+			"response": string(bodyBytes),
+			"media_id": mediaID,
+		})
+		return ""
+	}
+
+	// Read media content
+	mediaBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.ErrorCF("wecom_app", "Failed to read media content", map[string]any{
+			"error":    err.Error(),
+			"media_id": mediaID,
+		})
+		return ""
+	}
+
+	// Determine content type and filename
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	// Use provided filename hint if available
+	filename := mediaID
+	if len(filenameHint) > 0 && filenameHint[0] != "" {
+		filename = filenameHint[0]
+	} else {
+		// Extract filename from Content-Disposition header
+		if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+			if _, params, err := mime.ParseMediaType(cd); err == nil {
+				if fn := params["filename"]; fn != "" {
+					filename = fn
+				}
+			}
+		}
+	}
+
+	// Add appropriate extension based on media type and content type
+	if !strings.Contains(filename, ".") {
+		switch mediaType {
+		case "image":
+			if strings.Contains(contentType, "jpeg") || strings.Contains(contentType, "jpg") {
+				filename += ".jpg"
+			} else if strings.Contains(contentType, "png") {
+				filename += ".png"
+			} else if strings.Contains(contentType, "gif") {
+				filename += ".gif"
+			} else if strings.Contains(contentType, "webp") {
+				filename += ".webp"
+			} else if strings.Contains(contentType, "bmp") {
+				filename += ".bmp"
+			} else {
+				filename += ".jpg" // default
+			}
+		case "voice":
+			if strings.Contains(contentType, "amr") {
+				filename += ".amr"
+			} else if strings.Contains(contentType, "speex") {
+				filename += ".spx"
+			} else if strings.Contains(contentType, "mp3") {
+				filename += ".mp3"
+			} else if strings.Contains(contentType, "wav") {
+				filename += ".wav"
+			} else {
+				filename += ".amr" // default
+			}
+		case "video":
+			if strings.Contains(contentType, "mp4") {
+				filename += ".mp4"
+			} else if strings.Contains(contentType, "avi") {
+				filename += ".avi"
+			} else if strings.Contains(contentType, "mov") {
+				filename += ".mov"
+			} else {
+				filename += ".mp4" // default
+			}
+		case "file":
+			// For generic files, try to infer from content type
+			if strings.Contains(contentType, "pdf") {
+				filename += ".pdf"
+			} else if strings.Contains(contentType, "msword") {
+				filename += ".doc"
+			} else if strings.Contains(contentType, "wordprocessingml") {
+				filename += ".docx"
+			} else if strings.Contains(contentType, "ms-excel") {
+				filename += ".xls"
+			} else if strings.Contains(contentType, "spreadsheetml") {
+				filename += ".xlsx"
+			} else if strings.Contains(contentType, "ms-powerpoint") {
+				filename += ".ppt"
+			} else if strings.Contains(contentType, "presentationml") {
+				filename += ".pptx"
+			} else if strings.Contains(contentType, "zip") {
+				filename += ".zip"
+			} else if strings.Contains(contentType, "rar") {
+				filename += ".rar"
+			} else if strings.Contains(contentType, "7z") {
+				filename += ".7z"
+			} else if strings.Contains(contentType, "text/plain") {
+				filename += ".txt"
+			} else if strings.Contains(contentType, "json") {
+				filename += ".json"
+			} else if strings.Contains(contentType, "xml") {
+				filename += ".xml"
+			} else {
+				filename += ".bin" // default binary
+			}
+		default:
+			filename += ".bin"
+		}
+	}
+
+	// Write media bytes to temporary file
+	tmpFile, err := os.CreateTemp("", "wecom-media-*"+filepath.Ext(filename))
+	if err != nil {
+		logger.ErrorCF("wecom_app", "Failed to create temp file", map[string]any{
+			"error":    err.Error(),
+			"media_id": mediaID,
+		})
+		return ""
+	}
+	defer tmpFile.Close()
+
+	if _, err := tmpFile.Write(mediaBytes); err != nil {
+		logger.ErrorCF("wecom_app", "Failed to write media file", map[string]any{
+			"error":    err.Error(),
+			"media_id": mediaID,
+		})
+		os.Remove(tmpFile.Name())
+		return ""
+	}
+
+	localPath := tmpFile.Name()
+
+	// Register with media store
+	scope := channels.BuildMediaScope("wecom_app", senderID, msgID)
+	ref, err := store.Store(localPath, media.MediaMeta{
+		Filename:    filename,
+		ContentType: contentType,
+		Source:      "wecom_app",
+	}, scope)
+	if err != nil {
+		logger.ErrorCF("wecom_app", "Failed to store media", map[string]any{
+			"error":    err.Error(),
+			"media_id": mediaID,
+			"path":     localPath,
+		})
+		os.Remove(localPath)
+		return ""
+	}
+
+	logger.InfoCF("wecom_app", "Media downloaded and stored", map[string]any{
+		"media_id": mediaID,
+		"type":     mediaType,
+		"size":     len(mediaBytes),
+		"ref":      ref,
+	})
+
+	return ref
 }
 
 // WebhookPath returns the path for registering on the shared HTTP server.
@@ -595,8 +884,8 @@ func (c *WeComAppChannel) handleMessageCallback(ctx context.Context, w http.Resp
 
 // processMessage processes the received message
 func (c *WeComAppChannel) processMessage(ctx context.Context, msg WeComXMLMessage) {
-	// Skip non-text messages for now (can be extended)
-	if msg.MsgType != "text" && msg.MsgType != "image" && msg.MsgType != "voice" {
+	// Support text, image, voice, video, file messages
+	if msg.MsgType != "text" && msg.MsgType != "image" && msg.MsgType != "voice" && msg.MsgType != "video" && msg.MsgType != "file" {
 		logger.DebugCF("wecom_app", "Skipping non-supported message type", map[string]any{
 			"msg_type": msg.MsgType,
 		})
@@ -631,11 +920,83 @@ func (c *WeComAppChannel) processMessage(ctx context.Context, msg WeComXMLMessag
 	}
 
 	content := msg.Content
+	var mediaRefs []string
+
+	// Handle media messages
+	// Note: senderID and msgID are already defined above
+	if msg.MsgType == "image" {
+		if msg.PicUrl != "" {
+			// Add image URL to media refs
+			mediaRefs = append(mediaRefs, msg.PicUrl)
+			metadata["pic_url"] = msg.PicUrl
+			if content == "" {
+				content = fmt.Sprintf("Received an image")
+			}
+		}
+		if msg.MediaId != "" {
+			// Download media if media store is available
+			if ref := c.downloadAndStoreMedia(ctx, msg.MediaId, "image", senderID, msgID); ref != "" {
+				mediaRefs = append(mediaRefs, ref)
+			}
+		}
+	} else if msg.MsgType == "voice" {
+		if msg.MediaId != "" {
+			if ref := c.downloadAndStoreMedia(ctx, msg.MediaId, "voice", senderID, msgID); ref != "" {
+				mediaRefs = append(mediaRefs, ref)
+			}
+		}
+		if content == "" {
+			content = fmt.Sprintf("Received a voice message (format: %s)", msg.Format)
+		}
+	} else if msg.MsgType == "video" {
+		if msg.MediaId != "" {
+			if ref := c.downloadAndStoreMedia(ctx, msg.MediaId, "video", senderID, msgID); ref != "" {
+				mediaRefs = append(mediaRefs, ref)
+			}
+		}
+		if msg.ThumbMediaId != "" {
+			metadata["thumb_media_id"] = msg.ThumbMediaId
+		}
+		if content == "" {
+			content = "Received a video"
+		}
+	} else if msg.MsgType == "file" {
+		if msg.MediaId != "" {
+			// Pass filename hint if available
+			var ref string
+			if msg.FileName != "" {
+				ref = c.downloadAndStoreMedia(ctx, msg.MediaId, "file", senderID, msgID, msg.FileName)
+			} else {
+				ref = c.downloadAndStoreMedia(ctx, msg.MediaId, "file", senderID, msgID)
+			}
+			if ref != "" {
+				mediaRefs = append(mediaRefs, ref)
+			}
+		}
+		if msg.FileName != "" {
+			metadata["file_name"] = msg.FileName
+		}
+		if msg.FileSize > 0 {
+			metadata["file_size"] = fmt.Sprintf("%d", msg.FileSize)
+		}
+		if content == "" {
+			fileName := msg.FileName
+			if fileName == "" {
+				fileName = "unknown"
+			}
+			if msg.FileSize > 0 {
+				content = fmt.Sprintf("Received a file: %s (%.2f KB)", fileName, float64(msg.FileSize)/1024)
+			} else {
+				content = fmt.Sprintf("Received a file: %s", fileName)
+			}
+		}
+	}
 
 	logger.DebugCF("wecom_app", "Received message", map[string]any{
-		"sender_id": senderID,
-		"msg_type":  msg.MsgType,
-		"preview":   utils.Truncate(content, 50),
+		"sender_id":  senderID,
+		"msg_type":   msg.MsgType,
+		"preview":    utils.Truncate(content, 50),
+		"media_refs": len(mediaRefs),
 	})
 
 	// Build sender info
@@ -646,7 +1007,7 @@ func (c *WeComAppChannel) processMessage(ctx context.Context, msg WeComXMLMessag
 	}
 
 	// Handle the message through the base channel
-	c.HandleMessage(ctx, peer, messageID, senderID, chatID, content, nil, metadata, appSender)
+	c.HandleMessage(ctx, peer, messageID, senderID, chatID, content, mediaRefs, metadata, appSender)
 }
 
 // tokenRefreshLoop periodically refreshes the access token

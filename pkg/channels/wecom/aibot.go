@@ -10,17 +10,253 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/h2non/filetype"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/channels"
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/identity"
 	"github.com/sipeed/picoclaw/pkg/logger"
+	"github.com/sipeed/picoclaw/pkg/media"
 	"github.com/sipeed/picoclaw/pkg/utils"
 )
+
+// decryptedMedia holds information about a decrypted media file
+type decryptedMedia struct {
+	LocalPath   string
+	Data        []byte
+	IsTextFile  bool
+	TextContent string
+	Filename    string // original filename from message or HTTP header
+	ContentType string // detected MIME type
+}
+
+// downloadAndDecryptMedia downloads and decrypts a WeCom media file from an encrypted URL.
+// Returns decrypted media information, or nil on error.
+// filenameHint can be provided from the message's file.filename field.
+func (c *WeComAIBotChannel) downloadAndDecryptMedia(ctx context.Context, encryptedURL, mediaType, filenameHint string) *decryptedMedia {
+	if c.config.EncodingAESKey == "" {
+		logger.WarnC("wecom_aibot", "No EncodingAESKey configured, cannot decrypt media")
+		return nil
+	}
+
+	// Download encrypted data
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, encryptedURL, nil)
+	if err != nil {
+		logger.ErrorCF("wecom_aibot", "Failed to create download request", map[string]any{
+			"error": err.Error(),
+			"url":   encryptedURL,
+		})
+		return nil
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.ErrorCF("wecom_aibot", "Failed to download encrypted media", map[string]any{
+			"error": err.Error(),
+			"url":   encryptedURL,
+		})
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		logger.ErrorCF("wecom_aibot", "Media download failed", map[string]any{
+			"status": resp.StatusCode,
+			"url":    encryptedURL,
+		})
+		return nil
+	}
+
+	// Read encrypted data
+	encryptedData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.ErrorCF("wecom_aibot", "Failed to read encrypted data", map[string]any{
+			"error": err.Error(),
+		})
+		return nil
+	}
+
+	logger.InfoCF("wecom_aibot", "Downloaded encrypted media", map[string]any{
+		"size":        len(encryptedData),
+		"url":         encryptedURL,
+		"content-type": resp.Header.Get("Content-Type"),
+	})
+
+	// Extract filename from Content-Disposition header if available
+	var filename string
+	if filenameHint != "" {
+		filename = filenameHint
+	} else if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+		// Parse Content-Disposition header for filename
+		// Format: attachment; filename="file.txt" or attachment; filename*=UTF-8''file%20name.txt
+		if strings.Contains(cd, "filename*=") {
+			// RFC 5987 encoded filename
+			parts := strings.Split(cd, "filename*=")
+			if len(parts) > 1 {
+				encodedName := strings.TrimSpace(parts[1])
+				// Remove quotes if present
+				encodedName = strings.Trim(encodedName, "\"'")
+				// Extract the actual filename (after charset and language, e.g., "UTF-8''filename.txt")
+				if idx := strings.Index(encodedName, "''"); idx >= 0 {
+					encodedName = encodedName[idx+2:]
+				}
+				// URL decode
+				if decoded, err := url.PathUnescape(encodedName); err == nil {
+					filename = decoded
+				}
+			}
+		} else if strings.Contains(cd, "filename=") {
+			// Simple filename
+			parts := strings.Split(cd, "filename=")
+			if len(parts) > 1 {
+				filename = strings.TrimSpace(parts[1])
+				filename = strings.Trim(filename, "\"'")
+			}
+		}
+	}
+
+	logger.InfoCF("wecom_aibot", "Extracted filename", map[string]any{
+		"filename":      filename,
+		"filename_hint": filenameHint,
+	})
+
+	// Decode AES key
+	aesKey, err := decodeWeComAESKey(c.config.EncodingAESKey)
+	if err != nil {
+		logger.ErrorCF("wecom_aibot", "Failed to decode AES key", map[string]any{
+			"error": err.Error(),
+		})
+		return nil
+	}
+
+	// Decrypt using AES-CBC (media files don't have the frame structure like messages)
+	// For media files, we just decrypt and unpad, no frame unpacking needed
+	decryptedData, err := decryptAESCBC(aesKey, encryptedData)
+	if err != nil {
+		logger.ErrorCF("wecom_aibot", "Failed to decrypt media", map[string]any{
+			"error": err.Error(),
+			"size":  len(encryptedData),
+		})
+		return nil
+	}
+
+	logger.InfoCF("wecom_aibot", "Successfully decrypted media", map[string]any{
+		"decrypted_size": len(decryptedData),
+		"original_size":  len(encryptedData),
+	})
+
+	// Check if it's a text file
+	isText, textContent := isTextFile(decryptedData)
+
+	// Determine file extension
+	ext := ".bin"
+	switch mediaType {
+	case "image":
+		ext = ".jpg"
+	case "voice":
+		ext = ".amr"
+	case "file":
+		if isText {
+			ext = ".txt"
+		} else {
+			ext = ".bin"
+		}
+	}
+
+	// Save decrypted data to temporary file
+	tmpFile, err := os.CreateTemp("", "wecom-decrypted-*"+ext)
+	if err != nil {
+		logger.ErrorCF("wecom_aibot", "Failed to create temp file", map[string]any{
+			"error": err.Error(),
+		})
+		return nil
+	}
+	defer tmpFile.Close()
+
+	if _, err := tmpFile.Write(decryptedData); err != nil {
+		logger.ErrorCF("wecom_aibot", "Failed to write decrypted data", map[string]any{
+			"error": err.Error(),
+		})
+		os.Remove(tmpFile.Name())
+		return nil
+	}
+
+	localPath := tmpFile.Name()
+
+	// Detect actual MIME type using magic bytes
+	contentType := "application/octet-stream" // default fallback
+	kind, err := filetype.MatchFile(localPath)
+	if err == nil && kind != filetype.Unknown {
+		contentType = kind.MIME.Value
+	} else if isText {
+		contentType = "text/plain"
+	}
+
+	logger.InfoCF("wecom_aibot", "Decrypted media saved", map[string]any{
+		"path":         localPath,
+		"size":         len(decryptedData),
+		"is_text":      isText,
+		"has_text":     textContent != "",
+		"content_type": contentType,
+	})
+
+	return &decryptedMedia{
+		LocalPath:   localPath,
+		Data:        decryptedData,
+		IsTextFile:  isText,
+		TextContent: textContent,
+		Filename:    filename,
+		ContentType: contentType,
+	}
+}
+
+// isTextFile checks if data looks like a text file and extracts preview if it is.
+// Returns (isText bool, textContent string)
+func isTextFile(data []byte) (bool, string) {
+	if len(data) == 0 {
+		return false, ""
+	}
+
+	// Sample first 4KB to determine if it's text
+	sampleSize := len(data)
+	if sampleSize > 4096 {
+		sampleSize = 4096
+	}
+
+	badCount := 0
+	for i := 0; i < sampleSize; i++ {
+		b := data[i]
+		isWhitespace := b == 0x09 || b == 0x0a || b == 0x0d // \t \n \r
+		isPrintable := b >= 0x20 && b != 0x7f
+		if !isWhitespace && !isPrintable {
+			badCount++
+		}
+	}
+
+	badRatio := float64(badCount) / float64(sampleSize)
+	isText := badRatio <= 0.02
+
+	if !isText {
+		return false, ""
+	}
+
+	// Extract text content (limit to 12000 chars)
+	textContent := string(data)
+	if len(textContent) > 12000 {
+		textContent = textContent[:12000] + "\n…(已截断)"
+	}
+
+	return true, strings.TrimSpace(textContent)
+}
 
 // WeComAIBotChannel implements the Channel interface for WeCom AI Bot (企业微信智能机器人)
 type WeComAIBotChannel struct {
@@ -81,6 +317,17 @@ type WeComAIBotMessage struct {
 	Image *struct {
 		URL string `json:"url"`
 	} `json:"image,omitempty"`
+	// voice message
+	Voice *struct {
+		Content string `json:"content"` // voice recognition text
+	} `json:"voice,omitempty"`
+	// file message
+	File *struct {
+		URL      string `json:"url"`      // file download URL
+		Filename string `json:"filename"` // original filename (optional)
+		FileName string `json:"fileName"` // alternative field name
+		Name     string `json:"name"`     // another alternative
+	} `json:"file,omitempty"`
 	// mixed message (text + image)
 	Mixed *struct {
 		MsgItem []struct {
@@ -461,6 +708,10 @@ func (c *WeComAIBotChannel) processMessage(
 		return c.handleStreamMessage(ctx, msg, timestamp, nonce)
 	case "image":
 		return c.handleImageMessage(ctx, msg, timestamp, nonce)
+	case "voice":
+		return c.handleVoiceMessage(ctx, msg, timestamp, nonce)
+	case "file":
+		return c.handleFileMessage(ctx, msg, timestamp, nonce)
 	case "mixed":
 		return c.handleMixedMessage(ctx, msg, timestamp, nonce)
 	case "event":
@@ -607,26 +858,376 @@ func (c *WeComAIBotChannel) handleImageMessage(
 	msg WeComAIBotMessage,
 	timestamp, nonce string,
 ) string {
-	logger.WarnC("wecom_aibot", "Image message type not yet fully implemented")
 	if msg.Image == nil {
 		logger.ErrorC("wecom_aibot", "Image message missing image field")
 		return c.encryptEmptyResponse(timestamp, nonce)
 	}
 
 	imageURL := msg.Image.URL
+	userID := msg.From.UserID
+	if userID == "" {
+		userID = "unknown"
+	}
 
-	// For now, just acknowledge receipt without echoing the image
-	return c.encryptResponse("", timestamp, nonce, WeComAIBotStreamResponse{
-		MsgType: "stream",
-		Stream: WeComAIBotStreamInfo{
-			ID:     c.generateStreamID(),
-			Finish: true,
-			Content: fmt.Sprintf(
-				"Image received (URL: %s), but image messages are not yet supported",
-				imageURL,
-			),
-		},
-	})
+	chatID := msg.ChatID
+	if chatID == "" {
+		chatID = userID
+	}
+
+	streamID := c.generateStreamID()
+	deadline := time.Now().Add(30 * time.Second)
+	taskCtx, taskCancel := context.WithCancel(c.ctx)
+
+	task := &streamTask{
+		StreamID:    streamID,
+		ChatID:      chatID,
+		ResponseURL: msg.ResponseURL,
+		Question:    fmt.Sprintf("[Image: %s]", imageURL),
+		CreatedTime: time.Now(),
+		Deadline:    deadline,
+		Finished:    false,
+		answerCh:    make(chan string, 1),
+		ctx:         taskCtx,
+		cancel:      taskCancel,
+	}
+
+	c.taskMu.Lock()
+	c.streamTasks[streamID] = task
+	c.chatTasks[chatID] = append(c.chatTasks[chatID], task)
+	c.taskMu.Unlock()
+
+	// Publish to agent with image URL in content
+	go func() {
+		sender := bus.SenderInfo{
+			Platform:    "wecom_aibot",
+			PlatformID:  userID,
+			CanonicalID: identity.BuildCanonicalID("wecom_aibot", userID),
+			DisplayName: userID,
+		}
+		peerKind := "direct"
+		if msg.ChatType == "group" {
+			peerKind = "group"
+		}
+		peer := bus.Peer{Kind: peerKind, ID: chatID}
+
+		// Log the image URL for debugging
+		logger.InfoCF("wecom_aibot", "Processing image message", map[string]any{
+			"image_url": imageURL,
+			"msg_id":    msg.MsgID,
+			"user_id":   userID,
+			"chat_id":   chatID,
+		})
+
+		// Download, decrypt and store the image
+		var mediaRefs []string
+		store := c.GetMediaStore()
+		if store != nil {
+			// Try to download and decrypt the image
+			decrypted := c.downloadAndDecryptMedia(task.ctx, imageURL, "image", "")
+
+			if decrypted != nil {
+				logger.InfoCF("wecom_aibot", "Image decrypted successfully", map[string]any{
+					"local_path": decrypted.LocalPath,
+					"image_url":  imageURL,
+				})
+
+				// Store in media store
+				scope := channels.BuildMediaScope("wecom_aibot", chatID, msg.MsgID)
+				ref, err := store.Store(decrypted.LocalPath, media.MediaMeta{
+					Filename:    filepath.Base(decrypted.LocalPath),
+					ContentType: decrypted.ContentType,
+					Source:      "wecom_aibot",
+				}, scope)
+
+				if err != nil {
+					logger.ErrorCF("wecom_aibot", "Failed to store image in media store", map[string]any{
+						"error":      err.Error(),
+						"local_path": decrypted.LocalPath,
+					})
+					// Clean up temp file
+					os.Remove(decrypted.LocalPath)
+				} else {
+					logger.InfoCF("wecom_aibot", "Image stored in media store", map[string]any{
+						"ref":        ref,
+						"local_path": decrypted.LocalPath,
+					})
+					mediaRefs = append(mediaRefs, ref)
+				}
+			} else {
+				logger.ErrorCF("wecom_aibot", "Failed to decrypt image", map[string]any{
+					"image_url": imageURL,
+				})
+				// Don't add the URL as fallback since it's encrypted and won't work
+			}
+		} else {
+			logger.WarnC("wecom_aibot", "No media store available")
+		}
+
+		metadata := map[string]string{
+			"channel":      "wecom_aibot",
+			"chat_type":    msg.ChatType,
+			"msg_type":     "image",
+			"msgid":        msg.MsgID,
+			"aibotid":      msg.AIBotID,
+			"stream_id":    streamID,
+			"response_url": msg.ResponseURL,
+			"image_url":    imageURL,
+		}
+
+		c.HandleMessage(task.ctx, peer, msg.MsgID, userID, chatID,
+			fmt.Sprintf("Received an image: %s", imageURL), mediaRefs, metadata, sender)
+	}()
+
+	return c.getStreamResponse(task, timestamp, nonce)
+}
+
+// handleVoiceMessage handles voice messages
+func (c *WeComAIBotChannel) handleVoiceMessage(
+	ctx context.Context,
+	msg WeComAIBotMessage,
+	timestamp, nonce string,
+) string {
+	if msg.Voice == nil {
+		logger.ErrorC("wecom_aibot", "Voice message missing voice field")
+		return c.encryptEmptyResponse(timestamp, nonce)
+	}
+
+	// Voice message contains recognized text in the Content field
+	content := msg.Voice.Content
+	if content == "" {
+		content = "[Voice message - no text recognized]"
+	}
+
+	userID := msg.From.UserID
+	if userID == "" {
+		userID = "unknown"
+	}
+
+	chatID := msg.ChatID
+	if chatID == "" {
+		chatID = userID
+	}
+
+	streamID := c.generateStreamID()
+	deadline := time.Now().Add(30 * time.Second)
+	taskCtx, taskCancel := context.WithCancel(c.ctx)
+
+	task := &streamTask{
+		StreamID:    streamID,
+		ChatID:      chatID,
+		ResponseURL: msg.ResponseURL,
+		Question:    content,
+		CreatedTime: time.Now(),
+		Deadline:    deadline,
+		Finished:    false,
+		answerCh:    make(chan string, 1),
+		ctx:         taskCtx,
+		cancel:      taskCancel,
+	}
+
+	c.taskMu.Lock()
+	c.streamTasks[streamID] = task
+	c.chatTasks[chatID] = append(c.chatTasks[chatID], task)
+	c.taskMu.Unlock()
+
+	go func() {
+		sender := bus.SenderInfo{
+			Platform:    "wecom_aibot",
+			PlatformID:  userID,
+			CanonicalID: identity.BuildCanonicalID("wecom_aibot", userID),
+			DisplayName: userID,
+		}
+		peerKind := "direct"
+		if msg.ChatType == "group" {
+			peerKind = "group"
+		}
+		peer := bus.Peer{Kind: peerKind, ID: chatID}
+		metadata := map[string]string{
+			"channel":      "wecom_aibot",
+			"chat_type":    msg.ChatType,
+			"msg_type":     "voice",
+			"msgid":        msg.MsgID,
+			"aibotid":      msg.AIBotID,
+			"stream_id":    streamID,
+			"response_url": msg.ResponseURL,
+		}
+		c.HandleMessage(task.ctx, peer, msg.MsgID, userID, chatID,
+			content, nil, metadata, sender)
+	}()
+
+	return c.getStreamResponse(task, timestamp, nonce)
+}
+
+// handleFileMessage handles file messages
+func (c *WeComAIBotChannel) handleFileMessage(
+	ctx context.Context,
+	msg WeComAIBotMessage,
+	timestamp, nonce string,
+) string {
+	if msg.File == nil {
+		logger.ErrorC("wecom_aibot", "File message missing file field")
+		return c.encryptEmptyResponse(timestamp, nonce)
+	}
+
+	fileURL := msg.File.URL
+	// Get filename from message (try different field names)
+	filename := msg.File.Filename
+	if filename == "" {
+		filename = msg.File.FileName
+	}
+	if filename == "" {
+		filename = msg.File.Name
+	}
+
+	userID := msg.From.UserID
+	if userID == "" {
+		userID = "unknown"
+	}
+
+	chatID := msg.ChatID
+	if chatID == "" {
+		chatID = userID
+	}
+
+	streamID := c.generateStreamID()
+	deadline := time.Now().Add(30 * time.Second)
+	taskCtx, taskCancel := context.WithCancel(c.ctx)
+
+	task := &streamTask{
+		StreamID:    streamID,
+		ChatID:      chatID,
+		ResponseURL: msg.ResponseURL,
+		Question:    fmt.Sprintf("[File: %s]", fileURL),
+		CreatedTime: time.Now(),
+		Deadline:    deadline,
+		Finished:    false,
+		answerCh:    make(chan string, 1),
+		ctx:         taskCtx,
+		cancel:      taskCancel,
+	}
+
+	c.taskMu.Lock()
+	c.streamTasks[streamID] = task
+	c.chatTasks[chatID] = append(c.chatTasks[chatID], task)
+	c.taskMu.Unlock()
+
+	// Publish to agent with file URL
+	go func() {
+		sender := bus.SenderInfo{
+			Platform:    "wecom_aibot",
+			PlatformID:  userID,
+			CanonicalID: identity.BuildCanonicalID("wecom_aibot", userID),
+			DisplayName: userID,
+		}
+		peerKind := "direct"
+		if msg.ChatType == "group" {
+			peerKind = "group"
+		}
+		peer := bus.Peer{Kind: peerKind, ID: chatID}
+
+		logger.InfoCF("wecom_aibot", "Processing file message", map[string]any{
+			"file_url": fileURL,
+			"filename": filename,
+			"msg_id":   msg.MsgID,
+			"user_id":  userID,
+			"chat_id":  chatID,
+		})
+
+		// Download and decrypt the file
+		var mediaRefs []string
+		var finalContent string
+		store := c.GetMediaStore()
+
+		decrypted := c.downloadAndDecryptMedia(task.ctx, fileURL, "file", filename)
+
+		if decrypted != nil {
+			logger.InfoCF("wecom_aibot", "File decrypted successfully", map[string]any{
+				"local_path": decrypted.LocalPath,
+				"filename":   decrypted.Filename,
+				"file_url":   fileURL,
+				"is_text":    decrypted.IsTextFile,
+				"size":       len(decrypted.Data),
+			})
+
+			// Use decrypted filename if available, otherwise use hint
+			displayName := decrypted.Filename
+			if displayName == "" {
+				displayName = "未知文件"
+			}
+
+			if decrypted.IsTextFile && decrypted.TextContent != "" {
+				// For text files, put content in message body instead of as attachment
+				finalContent = fmt.Sprintf("Received a text file: **%s**\n\n```\n%s\n```\n\n(文件大小: %d 字节)",
+					displayName, decrypted.TextContent, len(decrypted.Data))
+				logger.InfoCF("wecom_aibot", "Text file content extracted", map[string]any{
+					"content_length": len(decrypted.TextContent),
+				})
+				// Clean up temp file since we extracted the text
+				os.Remove(decrypted.LocalPath)
+			} else {
+				// For binary files, check if it's an image (images can be sent to LLM)
+				isImage := strings.HasPrefix(decrypted.ContentType, "image/")
+
+				if store != nil {
+					scope := channels.BuildMediaScope("wecom_aibot", chatID, msg.MsgID)
+					ref, err := store.Store(decrypted.LocalPath, media.MediaMeta{
+						Filename:    displayName,
+						ContentType: decrypted.ContentType,
+						Source:      "wecom_aibot",
+					}, scope)
+
+					if err != nil {
+						logger.ErrorCF("wecom_aibot", "Failed to store file in media store", map[string]any{
+							"error":      err.Error(),
+							"local_path": decrypted.LocalPath,
+						})
+						os.Remove(decrypted.LocalPath)
+						finalContent = fmt.Sprintf("Received a file **%s** (size: %d bytes), but failed to store it", displayName, len(decrypted.Data))
+					} else {
+						logger.InfoCF("wecom_aibot", "File stored", map[string]any{
+							"ref":         ref,
+							"filename":    displayName,
+							"is_image":    isImage,
+							"content_type": decrypted.ContentType,
+						})
+
+						if isImage {
+							// Add image to mediaRefs so LLM can see it
+							mediaRefs = append(mediaRefs, ref)
+							finalContent = fmt.Sprintf("Received an image file: **%s** (size: %d bytes)", displayName, len(decrypted.Data))
+						} else {
+							// Non-image binary files cannot be processed by LLM
+							finalContent = fmt.Sprintf("Received a file **%s** (type: %s, size: %d bytes). This file type cannot be directly processed. Please describe what you need help with regarding this file.", displayName, decrypted.ContentType, len(decrypted.Data))
+						}
+					}
+				} else {
+					os.Remove(decrypted.LocalPath)
+					finalContent = fmt.Sprintf("Received a file **%s** (size: %d bytes), but no media store available", displayName, len(decrypted.Data))
+				}
+			}
+		} else {
+			logger.ErrorCF("wecom_aibot", "Failed to decrypt file", map[string]any{
+				"file_url": fileURL,
+			})
+			finalContent = "Received a file but failed to decrypt it"
+		}
+
+		metadata := map[string]string{
+			"channel":      "wecom_aibot",
+			"chat_type":    msg.ChatType,
+			"msg_type":     "file",
+			"msgid":        msg.MsgID,
+			"aibotid":      msg.AIBotID,
+			"stream_id":    streamID,
+			"response_url": msg.ResponseURL,
+			"file_url":     fileURL,
+		}
+
+		c.HandleMessage(task.ctx, peer, msg.MsgID, userID, chatID,
+			finalContent, mediaRefs, metadata, sender)
+	}()
+
+	return c.getStreamResponse(task, timestamp, nonce)
 }
 
 // handleMixedMessage handles mixed (text + image) messages
@@ -635,15 +1236,143 @@ func (c *WeComAIBotChannel) handleMixedMessage(
 	msg WeComAIBotMessage,
 	timestamp, nonce string,
 ) string {
-	logger.WarnC("wecom_aibot", "Mixed message type not yet fully implemented")
-	return c.encryptResponse("", timestamp, nonce, WeComAIBotStreamResponse{
-		MsgType: "stream",
-		Stream: WeComAIBotStreamInfo{
-			ID:      c.generateStreamID(),
-			Finish:  true,
-			Content: "Mixed message type is not yet supported",
-		},
-	})
+	if msg.Mixed == nil || len(msg.Mixed.MsgItem) == 0 {
+		logger.ErrorC("wecom_aibot", "Mixed message missing msg_item field")
+		return c.encryptEmptyResponse(timestamp, nonce)
+	}
+
+	userID := msg.From.UserID
+	if userID == "" {
+		userID = "unknown"
+	}
+
+	chatID := msg.ChatID
+	if chatID == "" {
+		chatID = userID
+	}
+
+	// Build content and media refs from mixed message items
+	var contentParts []string
+	var mediaRefs []string
+	var imageURLs []string
+
+	// Get media store for downloading images
+	store := c.GetMediaStore()
+
+	for idx, item := range msg.Mixed.MsgItem {
+		switch item.MsgType {
+		case "text":
+			if item.Text != nil && item.Text.Content != "" {
+				contentParts = append(contentParts, item.Text.Content)
+			}
+		case "image":
+			if item.Image != nil && item.Image.URL != "" {
+				imageURL := item.Image.URL
+				contentParts = append(contentParts, fmt.Sprintf("[Image: %s]", imageURL))
+				imageURLs = append(imageURLs, imageURL)
+
+				logger.InfoCF("wecom_aibot", "Processing mixed message image", map[string]any{
+					"image_url": imageURL,
+					"msg_id":    msg.MsgID,
+					"item_idx":  idx,
+				})
+
+				// Try to download, decrypt and store the image
+				if store != nil {
+					// Create a context for this operation
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					decrypted := c.downloadAndDecryptMedia(ctx, imageURL, "image", "")
+					cancel()
+
+					if decrypted != nil {
+						scope := channels.BuildMediaScope("wecom_aibot", chatID, msg.MsgID)
+						ref, err := store.Store(decrypted.LocalPath, media.MediaMeta{
+							Filename:    filepath.Base(decrypted.LocalPath),
+							ContentType: decrypted.ContentType,
+							Source:      "wecom_aibot",
+						}, scope)
+
+						if err == nil {
+							logger.InfoCF("wecom_aibot", "Mixed message image stored", map[string]any{
+								"ref": ref,
+								"idx": idx,
+							})
+							mediaRefs = append(mediaRefs, ref)
+						} else {
+							logger.ErrorCF("wecom_aibot", "Failed to store mixed image", map[string]any{
+								"error": err.Error(),
+								"idx":   idx,
+							})
+							os.Remove(decrypted.LocalPath)
+						}
+					} else {
+						logger.ErrorCF("wecom_aibot", "Failed to decrypt mixed image", map[string]any{
+							"image_url": imageURL,
+							"idx":       idx,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	content := strings.Join(contentParts, "\n")
+	if content == "" {
+		content = "Received mixed message with no parsable content"
+	}
+
+	streamID := c.generateStreamID()
+	deadline := time.Now().Add(30 * time.Second)
+	taskCtx, taskCancel := context.WithCancel(c.ctx)
+
+	task := &streamTask{
+		StreamID:    streamID,
+		ChatID:      chatID,
+		ResponseURL: msg.ResponseURL,
+		Question:    content,
+		CreatedTime: time.Now(),
+		Deadline:    deadline,
+		Finished:    false,
+		answerCh:    make(chan string, 1),
+		ctx:         taskCtx,
+		cancel:      taskCancel,
+	}
+
+	c.taskMu.Lock()
+	c.streamTasks[streamID] = task
+	c.chatTasks[chatID] = append(c.chatTasks[chatID], task)
+	c.taskMu.Unlock()
+
+	go func() {
+		sender := bus.SenderInfo{
+			Platform:    "wecom_aibot",
+			PlatformID:  userID,
+			CanonicalID: identity.BuildCanonicalID("wecom_aibot", userID),
+			DisplayName: userID,
+		}
+		peerKind := "direct"
+		if msg.ChatType == "group" {
+			peerKind = "group"
+		}
+		peer := bus.Peer{Kind: peerKind, ID: chatID}
+		metadata := map[string]string{
+			"channel":      "wecom_aibot",
+			"chat_type":    msg.ChatType,
+			"msg_type":     "mixed",
+			"msgid":        msg.MsgID,
+			"aibotid":      msg.AIBotID,
+			"stream_id":    streamID,
+			"response_url": msg.ResponseURL,
+		}
+		// Add image URLs to metadata
+		if len(imageURLs) > 0 {
+			metadata["image_urls"] = strings.Join(imageURLs, ",")
+		}
+		c.HandleMessage(task.ctx, peer, msg.MsgID, userID, chatID,
+			content, mediaRefs, metadata, sender)
+	}()
+
+	return c.getStreamResponse(task, timestamp, nonce)
 }
 
 // handleEventMessage handles event messages
