@@ -334,12 +334,18 @@ func serializeMessages(messages []Message) []any {
 			})
 		}
 		for _, mediaURL := range m.Media {
-			parts = append(parts, map[string]any{
-				"type": "image_url",
-				"image_url": map[string]any{
-					"url": mediaURL,
-				},
-			})
+			// Only send images - LiteLLM/most providers only support image formats
+			// Filter by checking the MIME type in data URL
+			if strings.HasPrefix(mediaURL, "data:image/") {
+				parts = append(parts, map[string]any{
+					"type": "image_url",
+					"image_url": map[string]any{
+						"url": mediaURL,
+					},
+				})
+			}
+			// Skip non-image files (PDF, Excel, etc.) - not supported by most LLM APIs
+			// The text description is already in m.Content
 		}
 
 		msg := map[string]any{

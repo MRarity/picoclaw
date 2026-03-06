@@ -1168,6 +1168,9 @@ func (al *AgentLoop) maybeSummarize(agent *AgentInstance, sessionKey, channel, c
 
 // forceCompression aggressively reduces context when the limit is hit.
 // It drops the oldest 50% of messages (keeping system prompt and last user message).
+// CRITICAL: Also strips media attachments from old messages to reduce token count,
+// but keeps media in the most recent 5 messages so LLM can still see recent images.
+// Base64-encoded images can consume millions of tokens.
 func (al *AgentLoop) forceCompression(agent *AgentInstance, sessionKey string) {
 	history := agent.Sessions.GetHistory(sessionKey)
 	if len(history) <= 4 {
@@ -1187,35 +1190,65 @@ func (al *AgentLoop) forceCompression(agent *AgentInstance, sessionKey string) {
 
 	// New history structure:
 	// 1. System Prompt (with compression note appended)
-	// 2. Second half of conversation
-	// 3. Last message
+	// 2. Second half of conversation (with old media stripped, recent media kept)
+	// 3. Last message (media always kept)
 
 	droppedCount := mid
 	keptConversation := conversation[mid:]
+
+	// Strip media from old messages, but keep media in the most recent 5 messages
+	// This allows LLM to still see recent images while saving tokens on old ones
+	const keepRecentMediaCount = 5
+	var strippedMediaCount int
+
+	for i := range keptConversation {
+		// Calculate how many messages from the end (including last message not in keptConversation)
+		// keptConversation + lastMsg = total messages we're keeping
+		// We want to preserve media in the last 5 of those
+		totalKeptMsgs := len(keptConversation) + 1 // +1 for last message
+		msgIndexFromEnd := totalKeptMsgs - i       // How far from the end
+
+		// Only strip media if this message is NOT in the most recent 5
+		if msgIndexFromEnd > keepRecentMediaCount && len(keptConversation[i].Media) > 0 {
+			// Replace media with a note about what was removed
+			mediaCount := len(keptConversation[i].Media)
+			keptConversation[i].Content = keptConversation[i].Content +
+				fmt.Sprintf("\n[%d media attachment(s) removed during compression]", mediaCount)
+			keptConversation[i].Media = nil
+			strippedMediaCount += mediaCount
+		}
+	}
 
 	newHistory := make([]providers.Message, 0, 1+len(keptConversation)+1)
 
 	// Append compression note to the original system prompt instead of adding a new system message
 	// This avoids having two consecutive system messages which some APIs (like Zhipu) reject
 	compressionNote := fmt.Sprintf(
-		"\n\n[System Note: Emergency compression dropped %d oldest messages due to context limit]",
+		"\n\n[System Note: Emergency compression dropped %d oldest messages and stripped %d old media attachments (kept recent %d messages with media) due to context limit]",
 		droppedCount,
+		strippedMediaCount,
+		keepRecentMediaCount,
 	)
 	enhancedSystemPrompt := history[0]
 	enhancedSystemPrompt.Content = enhancedSystemPrompt.Content + compressionNote
 	newHistory = append(newHistory, enhancedSystemPrompt)
 
 	newHistory = append(newHistory, keptConversation...)
-	newHistory = append(newHistory, history[len(history)-1]) // Last message
+
+	// Keep media in the last message (it's always recent)
+	lastMsg := history[len(history)-1]
+	newHistory = append(newHistory, lastMsg)
 
 	// Update session
 	agent.Sessions.SetHistory(sessionKey, newHistory)
 	agent.Sessions.Save(sessionKey)
 
 	logger.WarnCF("agent", "Forced compression executed", map[string]any{
-		"session_key":  sessionKey,
-		"dropped_msgs": droppedCount,
-		"new_count":    len(newHistory),
+		"session_key":         sessionKey,
+		"dropped_msgs":        droppedCount,
+		"stripped_media":      strippedMediaCount,
+		"kept_recent_media_n": keepRecentMediaCount,
+		"new_count":           len(newHistory),
 	})
 }
 

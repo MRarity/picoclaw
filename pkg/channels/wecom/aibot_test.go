@@ -8,6 +8,17 @@ import (
 	"github.com/sipeed/picoclaw/pkg/config"
 )
 
+// Helper function for tests to create a minimal config
+func getTestConfig() *config.Config {
+	return &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace: "/tmp/picoclaw_test_workspace",
+			},
+		},
+	}
+}
+
 func TestNewWeComAIBotChannel(t *testing.T) {
 	t.Run("success with valid config", func(t *testing.T) {
 		cfg := config.WeComAIBotConfig{
@@ -18,7 +29,7 @@ func TestNewWeComAIBotChannel(t *testing.T) {
 		}
 
 		messageBus := bus.NewMessageBus()
-		ch, err := NewWeComAIBotChannel(cfg, messageBus)
+		ch, err := NewWeComAIBotChannel(cfg, getTestConfig(), messageBus)
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -39,7 +50,7 @@ func TestNewWeComAIBotChannel(t *testing.T) {
 		}
 
 		messageBus := bus.NewMessageBus()
-		_, err := NewWeComAIBotChannel(cfg, messageBus)
+		_, err := NewWeComAIBotChannel(cfg, getTestConfig(), messageBus)
 
 		if err == nil {
 			t.Fatal("Expected error for missing token, got nil")
@@ -53,7 +64,7 @@ func TestNewWeComAIBotChannel(t *testing.T) {
 		}
 
 		messageBus := bus.NewMessageBus()
-		_, err := NewWeComAIBotChannel(cfg, messageBus)
+		_, err := NewWeComAIBotChannel(cfg, getTestConfig(), messageBus)
 
 		if err == nil {
 			t.Fatal("Expected error for missing encoding key, got nil")
@@ -69,7 +80,7 @@ func TestWeComAIBotChannelStartStop(t *testing.T) {
 	}
 
 	messageBus := bus.NewMessageBus()
-	ch, err := NewWeComAIBotChannel(cfg, messageBus)
+	ch, err := NewWeComAIBotChannel(cfg, getTestConfig(), messageBus)
 	if err != nil {
 		t.Fatalf("Failed to create channel: %v", err)
 	}
@@ -104,7 +115,7 @@ func TestWeComAIBotChannelWebhookPath(t *testing.T) {
 		}
 
 		messageBus := bus.NewMessageBus()
-		ch, _ := NewWeComAIBotChannel(cfg, messageBus)
+		ch, _ := NewWeComAIBotChannel(cfg, getTestConfig(), messageBus)
 
 		expectedPath := "/webhook/wecom-aibot"
 		if ch.WebhookPath() != expectedPath {
@@ -122,7 +133,7 @@ func TestWeComAIBotChannelWebhookPath(t *testing.T) {
 		}
 
 		messageBus := bus.NewMessageBus()
-		ch, _ := NewWeComAIBotChannel(cfg, messageBus)
+		ch, _ := NewWeComAIBotChannel(cfg, getTestConfig(), messageBus)
 
 		if ch.WebhookPath() != customPath {
 			t.Errorf("Expected webhook path '%s', got '%s'", customPath, ch.WebhookPath())
@@ -138,7 +149,7 @@ func TestGenerateStreamID(t *testing.T) {
 	}
 
 	messageBus := bus.NewMessageBus()
-	ch, _ := NewWeComAIBotChannel(cfg, messageBus)
+	ch, _ := NewWeComAIBotChannel(cfg, getTestConfig(), messageBus)
 
 	// Generate multiple IDs and check they are unique
 	ids := make(map[string]bool)
@@ -165,7 +176,7 @@ func TestEncryptDecrypt(t *testing.T) {
 	}
 
 	messageBus := bus.NewMessageBus()
-	ch, _ := NewWeComAIBotChannel(cfg, messageBus)
+	ch, _ := NewWeComAIBotChannel(cfg, getTestConfig(), messageBus)
 
 	plaintext := "Hello, World!"
 	receiveid := ""

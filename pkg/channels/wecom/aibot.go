@@ -172,8 +172,19 @@ func (c *WeComAIBotChannel) downloadAndDecryptMedia(ctx context.Context, encrypt
 		}
 	}
 
-	// Save decrypted data to temporary file
-	tmpFile, err := os.CreateTemp("", "wecom-decrypted-*"+ext)
+	// Save decrypted data to workspace media directory instead of /tmp
+	// This ensures LLM can access the file via read_file tool
+	mediaDir := filepath.Join(c.cfg.WorkspacePath(), "media", "wecom")
+	if err := os.MkdirAll(mediaDir, 0755); err != nil {
+		logger.ErrorCF("wecom_aibot", "Failed to create media directory", map[string]any{
+			"error": err.Error(),
+			"path":  mediaDir,
+		})
+		// Fallback to temp directory if workspace is not accessible
+		mediaDir = os.TempDir()
+	}
+
+	tmpFile, err := os.CreateTemp(mediaDir, "wecom-decrypted-*"+ext)
 	if err != nil {
 		logger.ErrorCF("wecom_aibot", "Failed to create temp file", map[string]any{
 			"error": err.Error(),
@@ -262,6 +273,7 @@ func isTextFile(data []byte) (bool, string) {
 type WeComAIBotChannel struct {
 	*channels.BaseChannel
 	config      config.WeComAIBotConfig
+	cfg         *config.Config // full config for workspace access
 	ctx         context.Context
 	cancel      context.CancelFunc
 	streamTasks map[string]*streamTask   // streamID -> task (for poll lookups)
@@ -383,21 +395,23 @@ type WeComAIBotEncryptedResponse struct {
 
 // NewWeComAIBotChannel creates a new WeCom AI Bot channel instance
 func NewWeComAIBotChannel(
-	cfg config.WeComAIBotConfig,
+	channelCfg config.WeComAIBotConfig,
+	fullCfg *config.Config,
 	messageBus *bus.MessageBus,
 ) (*WeComAIBotChannel, error) {
-	if cfg.Token == "" || cfg.EncodingAESKey == "" {
+	if channelCfg.Token == "" || channelCfg.EncodingAESKey == "" {
 		return nil, fmt.Errorf("token and encoding_aes_key are required for WeCom AI Bot")
 	}
 
-	base := channels.NewBaseChannel("wecom_aibot", cfg, messageBus, cfg.AllowFrom,
+	base := channels.NewBaseChannel("wecom_aibot", channelCfg, messageBus, channelCfg.AllowFrom,
 		channels.WithMaxMessageLength(2048),
-		channels.WithReasoningChannelID(cfg.ReasoningChannelID),
+		channels.WithReasoningChannelID(channelCfg.ReasoningChannelID),
 	)
 
 	return &WeComAIBotChannel{
 		BaseChannel: base,
-		config:      cfg,
+		config:      channelCfg,
+		cfg:         fullCfg,
 		streamTasks: make(map[string]*streamTask),
 		chatTasks:   make(map[string][]*streamTask),
 	}, nil
@@ -922,8 +936,11 @@ func (c *WeComAIBotChannel) handleImageMessage(
 		var mediaRefs []string
 		store := c.GetMediaStore()
 		if store != nil {
-			// Try to download and decrypt the image
-			decrypted := c.downloadAndDecryptMedia(task.ctx, imageURL, "image", "")
+			// Use a separate context for image download with longer timeout
+			// to avoid being affected by task deadline
+			downloadCtx, downloadCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			decrypted := c.downloadAndDecryptMedia(downloadCtx, imageURL, "image", "")
+			downloadCancel()
 
 			if decrypted != nil {
 				logger.InfoCF("wecom_aibot", "Image decrypted successfully", map[string]any{
@@ -1138,7 +1155,11 @@ func (c *WeComAIBotChannel) handleFileMessage(
 		var finalContent string
 		store := c.GetMediaStore()
 
-		decrypted := c.downloadAndDecryptMedia(task.ctx, fileURL, "file", filename)
+		// Use a separate context for file download with longer timeout
+		// to avoid being affected by task deadline (30s may not be enough for large files)
+		downloadCtx, downloadCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		decrypted := c.downloadAndDecryptMedia(downloadCtx, fileURL, "file", filename)
+		downloadCancel()
 
 		if decrypted != nil {
 			logger.InfoCF("wecom_aibot", "File decrypted successfully", map[string]any{
@@ -1185,19 +1206,20 @@ func (c *WeComAIBotChannel) handleFileMessage(
 						finalContent = fmt.Sprintf("Received a file **%s** (size: %d bytes), but failed to store it", displayName, len(decrypted.Data))
 					} else {
 						logger.InfoCF("wecom_aibot", "File stored", map[string]any{
-							"ref":         ref,
-							"filename":    displayName,
-							"is_image":    isImage,
+							"ref":          ref,
+							"filename":     displayName,
+							"is_image":     isImage,
 							"content_type": decrypted.ContentType,
 						})
 
+						// Add all files to mediaRefs (images will be converted to base64, others to file:// URLs)
+						mediaRefs = append(mediaRefs, ref)
+
 						if isImage {
-							// Add image to mediaRefs so LLM can see it
-							mediaRefs = append(mediaRefs, ref)
 							finalContent = fmt.Sprintf("Received an image file: **%s** (size: %d bytes)", displayName, len(decrypted.Data))
 						} else {
-							// Non-image binary files cannot be processed by LLM
-							finalContent = fmt.Sprintf("Received a file **%s** (type: %s, size: %d bytes). This file type cannot be directly processed. Please describe what you need help with regarding this file.", displayName, decrypted.ContentType, len(decrypted.Data))
+							// Non-image files are passed as file:// URLs to LLM
+							finalContent = fmt.Sprintf("Received a file: **%s** (type: %s, size: %d bytes)", displayName, decrypted.ContentType, len(decrypted.Data))
 						}
 					}
 				} else {

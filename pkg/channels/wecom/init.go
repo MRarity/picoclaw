@@ -14,6 +14,6 @@ func init() {
 		return NewWeComAppChannel(cfg.Channels.WeComApp, b)
 	})
 	channels.RegisterFactory("wecom_aibot", func(cfg *config.Config, b *bus.MessageBus) (channels.Channel, error) {
-		return NewWeComAIBotChannel(cfg.Channels.WeComAIBot, b)
+		return NewWeComAIBotChannel(cfg.Channels.WeComAIBot, cfg, b)
 	})
 }
