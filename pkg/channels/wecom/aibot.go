@@ -3,6 +3,7 @@ package wecom
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -303,6 +304,7 @@ type streamTask struct {
 	StreamClosed   bool      // stream returned finish:true; waiting for agent to reply via response_url
 	StreamClosedAt time.Time // set when StreamClosed becomes true; used for accelerated cleanup
 	Finished       bool      // fully done
+	PendingMedia   []byte    // image data to send with next response_url message (base64-ready)
 }
 
 // WeComAIBotMessage represents the decrypted JSON message from WeCom AI Bot
@@ -450,6 +452,104 @@ func (c *WeComAIBotChannel) Stop(ctx context.Context) error {
 	return nil
 }
 
+// SendMedia implements the channels.MediaSender interface for WeComAIBot.
+// Stores media data in the active task so it can be sent together with text via response_url.
+// Since WeComAIBot response_url can only be used once, we save the image and let Send()
+// send both text and image together.
+func (c *WeComAIBotChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) error {
+	if !c.IsRunning() {
+		return channels.ErrNotRunning
+	}
+
+	store := c.GetMediaStore()
+	if store == nil {
+		logger.WarnC("wecom_aibot", "No media store available")
+		return fmt.Errorf("no media store available: %w", channels.ErrSendFailed)
+	}
+
+	// Find the active task for this chatID
+	c.taskMu.Lock()
+	defer c.taskMu.Unlock()
+
+	queue := c.chatTasks[msg.ChatID]
+	var task *streamTask
+
+	// Find the first unfinished task
+	for _, t := range queue {
+		if !t.Finished {
+			task = t
+			break
+		}
+	}
+
+	if task == nil {
+		logger.WarnCF("wecom_aibot", "No active task for media sending", map[string]any{
+			"chat_id": msg.ChatID,
+		})
+		return fmt.Errorf("no active task: %w", channels.ErrSendFailed)
+	}
+
+	// Process only the first media part (response_url limitation)
+	if len(msg.Parts) == 0 {
+		return nil
+	}
+
+	part := msg.Parts[0]
+
+	// Resolve media reference to local file
+	localPath, err := store.Resolve(part.Ref)
+	if err != nil {
+		logger.ErrorCF("wecom_aibot", "Failed to resolve media ref", map[string]any{
+			"ref":   part.Ref,
+			"error": err.Error(),
+		})
+		return err
+	}
+
+	// Read file data
+	imageData, err := os.ReadFile(localPath)
+	if err != nil {
+		logger.ErrorCF("wecom_aibot", "Failed to read media file", map[string]any{
+			"path":  localPath,
+			"error": err.Error(),
+		})
+		return err
+	}
+
+	// Check file size (max 2MB before encoding)
+	const maxImageSize = 2 * 1024 * 1024
+	if len(imageData) > maxImageSize {
+		logger.WarnCF("wecom_aibot", "Image too large for WeComAIBot", map[string]any{
+			"size":      len(imageData),
+			"max_size":  maxImageSize,
+			"path":      localPath,
+		})
+		return fmt.Errorf("image too large (%d bytes, max %d): %w", len(imageData), maxImageSize, channels.ErrSendFailed)
+	}
+
+	// Validate image type (only JPG/PNG supported)
+	kind, err := filetype.Match(imageData)
+	if err != nil || (kind.MIME.Type != "image" || (kind.Extension != "jpg" && kind.Extension != "jpeg" && kind.Extension != "png")) {
+		logger.WarnCF("wecom_aibot", "Unsupported media type for WeComAIBot", map[string]any{
+			"mime": kind.MIME.Value,
+			"ext":  kind.Extension,
+			"path": localPath,
+		})
+		return fmt.Errorf("unsupported media type %s: %w", kind.Extension, channels.ErrSendFailed)
+	}
+
+	// Store image data in task for later sending
+	task.PendingMedia = imageData
+
+	logger.InfoCF("wecom_aibot", "Stored media for pending send", map[string]any{
+		"chat_id": msg.ChatID,
+		"size":    len(imageData),
+		"type":    kind.Extension,
+	})
+
+	return nil
+}
+
 // Send delivers the agent reply into the active streamTask for msg.ChatID.
 // It writes into the earliest unfinished task in the queue (FIFO per chatID).
 // If the stream has already closed (deadline passed), it posts directly to response_url.
@@ -499,13 +599,36 @@ func (c *WeComAIBotChannel) Send(ctx context.Context, msg bus.OutboundMessage) e
 			"chat_id":   msg.ChatID,
 		})
 		if responseURL != "" {
-			if err := c.sendViaResponseURL(responseURL, msg.Content); err != nil {
-				logger.ErrorCF("wecom_aibot", "Failed to send via response_url", map[string]any{
-					"error":     err,
+			// Check if there's pending media to send
+			c.taskMu.RLock()
+			hasPendingMedia := len(task.PendingMedia) > 0
+			pendingMedia := task.PendingMedia
+			c.taskMu.RUnlock()
+
+			if hasPendingMedia {
+				// Send image via response_url
+				logger.InfoCF("wecom_aibot", "Sending pending media via response_url", map[string]any{
 					"stream_id": task.StreamID,
+					"size":      len(pendingMedia),
 				})
-				c.removeTask(task)
-				return fmt.Errorf("response_url delivery failed: %w", channels.ErrSendFailed)
+				if err := c.sendImageViaResponseURL(responseURL, pendingMedia); err != nil {
+					logger.ErrorCF("wecom_aibot", "Failed to send media via response_url", map[string]any{
+						"error":     err,
+						"stream_id": task.StreamID,
+					})
+					c.removeTask(task)
+					return fmt.Errorf("response_url media delivery failed: %w", channels.ErrSendFailed)
+				}
+			} else {
+				// Send text via response_url
+				if err := c.sendViaResponseURL(responseURL, msg.Content); err != nil {
+					logger.ErrorCF("wecom_aibot", "Failed to send via response_url", map[string]any{
+						"error":     err,
+						"stream_id": task.StreamID,
+					})
+					c.removeTask(task)
+					return fmt.Errorf("response_url delivery failed: %w", channels.ErrSendFailed)
+				}
 			}
 		} else {
 			logger.WarnCF("wecom_aibot", "Stream closed but no response_url available", map[string]any{
@@ -1537,6 +1660,63 @@ func (c *WeComAIBotChannel) sendViaResponseURL(responseURL, content string) erro
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("post to response_url failed: %w: %w", channels.ErrTemporary, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+
+	respBody, _ := io.ReadAll(resp.Body)
+	switch {
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return fmt.Errorf("response_url rate limited (%d): %s: %w",
+			resp.StatusCode, respBody, channels.ErrRateLimit)
+	case resp.StatusCode >= 500:
+		return fmt.Errorf("response_url server error (%d): %s: %w",
+			resp.StatusCode, respBody, channels.ErrTemporary)
+	default:
+		return fmt.Errorf("response_url returned %d: %s: %w",
+			resp.StatusCode, respBody, channels.ErrSendFailed)
+	}
+}
+
+// sendImageViaResponseURL posts an image message to the WeCom response_url.
+// Images must be base64 encoded (max 2MB before encoding, JPG/PNG only).
+// response_url is valid for 1 hour and can only be used once per callback.
+func (c *WeComAIBotChannel) sendImageViaResponseURL(responseURL string, imageData []byte) error {
+	// Calculate MD5 hash
+	hash := fmt.Sprintf("%x", md5.Sum(imageData))
+
+	// Encode to base64
+	base64Data := base64.StdEncoding.EncodeToString(imageData)
+
+	payload := map[string]any{
+		"msgtype": "image",
+		"image": map[string]string{
+			"base64": base64Data,
+			"md5":    hash,
+		},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal image payload: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, responseURL, bytes.NewBuffer(body))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("post image to response_url failed: %w: %w", channels.ErrTemporary, err)
 	}
 	defer resp.Body.Close()
 
